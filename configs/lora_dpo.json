@@ -1,0 +1,7 @@
+{
+  "r": 16,
+  "lora_alpha": 32,
+  "linear_lora_dropout": 0.05,
+  "lora_train_bias": "none",
+  "target_modules": ["q_a_proj", "q_b_proj", "kv_proj", "o_b_proj", "gate_proj", "up_proj", "down_proj"]
+}

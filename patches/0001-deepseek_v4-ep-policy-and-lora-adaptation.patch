@@ -1,0 +1,900 @@
+diff --git a/applications/ColossalChat/coati/dataset/loader.py b/applications/ColossalChat/coati/dataset/loader.py
+index 16fd385..72e2100 100755
+--- a/applications/ColossalChat/coati/dataset/loader.py
++++ b/applications/ColossalChat/coati/dataset/loader.py
+@@ -367,6 +367,8 @@ def apply_chat_template_and_mask(
+     }
+ 
+     # Format for RL.
++    gt_answer = None
++    test_cases = None
+     if "messages" in chat:
+         gt_answer = chat.get("gt_answer", None)
+         test_cases = chat.get("test_cases", None)
+@@ -375,7 +377,13 @@ def apply_chat_template_and_mask(
+     tokens = []
+     assistant_mask = []
+     for i, msg in enumerate(chat):
+-        msg_tokens = tokenizer.apply_chat_template([system_element, msg], tokenize=True, add_generation_prompt=True)
++        # transformers 5.x (TokenizersBackend) 默认返回 BatchEncoding, 需 return_dict 取 input_ids;
++        # 旧版直接返回 id 列表, 做兼容处理
++        _tpl_out = tokenizer.apply_chat_template(
++            [system_element, msg], tokenize=True, add_generation_prompt=True, return_dict=True
++        )
++        # transformers 5.x 的 BatchEncoding 不再继承 dict, 用鸭子类型判断
++        msg_tokens = _tpl_out["input_ids"] if hasattr(_tpl_out, "keys") and "input_ids" in _tpl_out else _tpl_out
+         # remove unexpected bos token
+         if i > 0 and msg_tokens[0] == tokenizer.bos_token_id:
+             msg_tokens = msg_tokens[1:]
+diff --git a/applications/ColossalChat/coati/models/loss.py b/applications/ColossalChat/coati/models/loss.py
+index 927dfd5..e12f24a 100755
+--- a/applications/ColossalChat/coati/models/loss.py
++++ b/applications/ColossalChat/coati/models/loss.py
+@@ -205,14 +205,27 @@ class OddsRatioLoss(nn.Module):
+         chosen_loss_mask: torch.Tensor,
+         reject_loss_mask: torch.Tensor,
+     ) -> torch.Tensor:
++        # Numerically stable ORPO odds-ratio loss (284B adaptation):
++        # log odds = logp - log(1 - exp(logp)) = logp - log1p(-exp(logp));
++        # log(sigmoid(x)) = -softplus(-x) = -logaddexp(0, -x), finite and
++        # bounded-gradient for any x (original log(sigmoid(x)) produces -inf
++        # once sigmoid saturates to 0 in bf16; the 1.0001 epsilon hack causes
++        # 1/(1.0001-exp(logp)) gradient spikes as logp -> 0).
+         chosen_logp = chosen_logp.to(dtype=torch.float32)
+         reject_logp = reject_logp.to(dtype=torch.float32)
+-        chosen_odds = chosen_logp - torch.log(-torch.exp(chosen_logp) + 1.0001)
+-        chosen_odds_masked = torch.sum(chosen_odds * chosen_loss_mask.float()) / torch.sum(chosen_loss_mask)
+-        reject_odds = reject_logp - torch.log(-torch.exp(reject_logp) + 1.0001)
+-        reject_odds_masked = torch.sum(reject_odds * reject_loss_mask.float()) / torch.sum(reject_loss_mask)
++        # NOTE: masked positions carry logp == 0 (calc_masked_log_probs multiplies the
++        # mask in), where log1p(-exp(logp)) = log(0) = -inf and the backward
++        # 1/(1-exp(logp)) divides by zero. Clamp logp to <= -1e-4: numerically safe,
++        # gradient bounded (~1e4, handled by grad clip); masked positions are zeroed
++        # out by the mask afterwards, so only near-probability-1 tokens are affected.
++        chosen_logp = chosen_logp.clamp(max=-1e-4)
++        reject_logp = reject_logp.clamp(max=-1e-4)
++        chosen_odds = chosen_logp - torch.log1p(-torch.exp(chosen_logp))
++        chosen_odds_masked = torch.sum(chosen_odds * chosen_loss_mask.float()) / torch.sum(chosen_loss_mask).clamp(min=1)
++        reject_odds = reject_logp - torch.log1p(-torch.exp(reject_logp))
++        reject_odds_masked = torch.sum(reject_odds * reject_loss_mask.float()) / torch.sum(reject_loss_mask).clamp(min=1)
+         log_odds_ratio = chosen_odds_masked - reject_odds_masked
+-        ratio = torch.log(torch.nn.functional.sigmoid(log_odds_ratio))
++        ratio = -torch.nn.functional.softplus(-log_odds_ratio)  # == log(sigmoid(log_odds_ratio)), stable
+         return ratio.to(dtype=torch.bfloat16), log_odds_ratio
+ 
+ 
+diff --git a/applications/ColossalChat/coati/trainer/orpo.py b/applications/ColossalChat/coati/trainer/orpo.py
+index 1de9f52..fdd8c9c 100644
+--- a/applications/ColossalChat/coati/trainer/orpo.py
++++ b/applications/ColossalChat/coati/trainer/orpo.py
+@@ -141,22 +141,25 @@ class ORPOTrainer(SLTrainer):
+                 reject_loss_mask = reject_loss_mask.fill_(1.0)
+ 
+             batch_size = chosen_input_ids.size()[0]
++            # 不传 labels: 模型内部 CE 在 bf16 autocast 下大 logits 会溢出为 nan
++            # (284B 实测第 1 步即触发), 与 SimPO 路线一致, 由 fp32 logits 重算 chosen NLL
+             actor_out = self.model(
+                 input_ids=torch.cat([chosen_input_ids, reject_input_ids]),
+                 attention_mask=torch.cat([chosen_attention_mask, reject_attention_mask]),
+-                labels=torch.cat(
+-                    [chosen_input_ids, torch.ones_like(reject_input_ids, dtype=reject_input_ids.dtype) * -100]
+-                ),
+             )
+-            torch.autograd.set_detect_anomaly(True)
+             actor_all_logits = actor_out["logits"].to(torch.float32)
+             actor_chosen_logits = actor_all_logits[:batch_size]
+             actor_reject_logits = actor_all_logits[batch_size:]
+             logprob_actor_chosen = calc_masked_log_probs(actor_chosen_logits, chosen_input_ids, chosen_loss_mask[:, 1:])
+ 
+             logprob_actor_reject = calc_masked_log_probs(actor_reject_logits, reject_input_ids, reject_loss_mask[:, 1:])
+-            # label_chosen[chosen_loss_mask[:, 1:] == 0] = -100
+-            chosen_nll = actor_out["loss"]
++            chosen_nll = torch.nn.functional.cross_entropy(
++                actor_chosen_logits[:, :-1].reshape(-1, actor_chosen_logits.size(-1)),
++                chosen_input_ids[:, 1:].reshape(-1),
++                reduction="none",
++            ).reshape(batch_size, -1)
++            cm1 = chosen_loss_mask[:, 1:]
++            chosen_nll = (chosen_nll * cm1).sum() / cm1.sum().clamp(min=1)
+             odds_ratio_loss, log_odds_ratio = self.odds_ratio_loss_fn(
+                 logprob_actor_chosen, logprob_actor_reject, chosen_loss_mask[:, 1:], reject_loss_mask[:, 1:]
+             )
+@@ -283,11 +286,7 @@ class ORPOTrainer(SLTrainer):
+                 actor_out = self.model(
+                     input_ids=torch.cat([chosen_input_ids, reject_input_ids]),
+                     attention_mask=torch.cat([chosen_attention_mask, reject_attention_mask]),
+-                    labels=torch.cat(
+-                        [chosen_input_ids, torch.ones_like(reject_input_ids, dtype=reject_input_ids.dtype) * -100]
+-                    ),
+                 )
+-                torch.autograd.set_detect_anomaly(True)
+                 actor_all_logits = actor_out["logits"].to(torch.float32)
+                 actor_chosen_logits = actor_all_logits[:batch_size]
+                 actor_reject_logits = actor_all_logits[batch_size:]
+@@ -298,7 +297,13 @@ class ORPOTrainer(SLTrainer):
+                 logprob_actor_reject = calc_masked_log_probs(
+                     actor_reject_logits, reject_input_ids, reject_loss_mask[:, 1:]
+                 )
+-                chosen_nll = actor_out["loss"]
++                chosen_nll = torch.nn.functional.cross_entropy(
++                    actor_chosen_logits[:, :-1].reshape(-1, actor_chosen_logits.size(-1)),
++                    chosen_input_ids[:, 1:].reshape(-1),
++                    reduction="none",
++                ).reshape(batch_size, -1)
++                cm1 = chosen_loss_mask[:, 1:]
++                chosen_nll = (chosen_nll * cm1).sum() / cm1.sum().clamp(min=1)
+                 odds_ratio_loss, log_odds_ratio = self.odds_ratio_loss_fn(
+                     logprob_actor_chosen, logprob_actor_reject, chosen_loss_mask[:, 1:], reject_loss_mask[:, 1:]
+                 )
+diff --git a/applications/ColossalChat/examples/training_scripts/lora_finetune.py b/applications/ColossalChat/examples/training_scripts/lora_finetune.py
+index 4045556..24b7b26 100644
+--- a/applications/ColossalChat/examples/training_scripts/lora_finetune.py
++++ b/applications/ColossalChat/examples/training_scripts/lora_finetune.py
+@@ -36,6 +36,30 @@ from colossalai.nn.optimizer import HybridAdam
+ from colossalai.utils import get_current_device
+ 
+ 
++def _fix_lazy_rotary_buffers(model) -> None:
++    """重建 RotaryEmbedding 的 inv_freq 类 buffer, 消除懒初始化自引用环。
++
++    transformers 5.x 的 RotaryEmbedding.__init__ 用 rope 初始化函数计算 inv_freq 并
++    `clone()` 出 original_inv_freq, 在 LazyInitContext 下形成自引用懒链, 物化时无限递归。
++    这些 buffer 均为 persistent=False (不存在于 checkpoint), 在 CPU 上重新构造同配置实例
++    并拷贝其 buffer 即可, 数值与官方实现完全一致。
++    """
++    from colossalai.lazy.lazy_init import LazyTensor
++
++    for _, mod in model.named_modules():
++        if not mod.__class__.__name__.endswith("RotaryEmbedding"):
++            continue
++        lazy_bufs = [n for n, b in mod.named_buffers() if isinstance(b, LazyTensor)]
++        if not lazy_bufs:
++            continue
++        with torch.device("cpu"):
++            fresh = mod.__class__(mod.config)
++        for n in lazy_bufs:
++            v = getattr(fresh, n, None)
++            if v is not None:
++                mod.register_buffer(n, v, persistent=False)
++
++
+ def all_reduce_mean(loss: torch.Tensor, plugin: Plugin) -> torch.Tensor:
+     loss = loss.data
+     group = getattr(plugin, "dp_group", None)
+@@ -111,6 +135,7 @@ def train(args) -> None:
+             tp_size=args.tp,
+             pp_size=args.pp,
+             zero_stage=args.zero_stage,
++            cpu_offload=args.zero_cpu_offload,
+             sp_size=args.sp,
+             sequence_parallelism_mode=args.sp_mode,
+             enable_sequence_parallelism=args.sp > 1,
+@@ -157,6 +182,7 @@ def train(args) -> None:
+         tokenizer,
+         args.dataset,
+         args.max_length,
++        args.system_prompt,
+     )
+ 
+     dataloader = plugin.prepare_dataloader(
+@@ -179,9 +205,12 @@ def train(args) -> None:
+         if isinstance(plugin, (GeminiPlugin, HybridParallelPlugin))
+         else nullcontext()
+     )
+-    attn_impl = "eager" if get_accelerator().name == "npu" else "flash_attention_2"
+-
+     config = AutoConfig.from_pretrained(args.pretrained, trust_remote_code=True)
++    # DeepSeek-V4 的 head_dim=512 超出 FlashAttention 上限, 仅支持 eager 注意力
++    attn_impl = "eager" if (get_accelerator().name == "npu" or config.model_type == "deepseek_v4") else "flash_attention_2"
++    # 预热导入模型模块: LazyInitContext 会包装 torch 工厂函数, 若模型类在懒初始化内
++    # 首次导入, 其函数签名注解 (torch.LongTensor | None) 求值会崩溃 (transformers 5.x)
++    _ = AutoModelForCausalLM._model_mapping[type(config)]
+ 
+     with init_ctx:
+         # from_pretrained is not compatible with LoRA, we load pretrained weights later.
+@@ -198,6 +227,18 @@ def train(args) -> None:
+             torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
+         )
+ 
++        # DeepSeek-V4: 融合 3D 专家张量转为逐专家 ModuleList (需在懒初始化内),
++        # 配合逐专家键的 checkpoint (见仓库脚本 split_experts_per_key.py),
++        # 使专家并行下每个 rank 只加载/保存 1/ep 的专家
++        if config.model_type == "deepseek_v4" and args.plugin == "moe" and args.ep > 1:
++            from colossalai.shardformer.modeling.deepseek_v4 import convert_fused_experts_to_modulelist
++
++            convert_fused_experts_to_modulelist(model)
++
++        # transformers 5.x 的 RotaryEmbedding 在懒初始化下会形成自引用懒链
++        # (inv_freq = f(self.original_inv_freq)), 物化时无限递归; 直接重建为具体值
++        _fix_lazy_rotary_buffers(model)
++
+         if args.lora_rank > 0:
+             if model.__class__.__name__.startswith("DeepseekV3"):
+                 lora_config = LoraConfig(
+@@ -206,6 +247,18 @@ def train(args) -> None:
+                     lora_alpha=args.lora_alpha,
+                     target_modules=["gate_proj", "up_proj", "down_proj"],
+                 )
++            elif model.__class__.__name__.startswith("DeepseekV4"):
++                # V4 路由专家为融合 3D 参数 (非 nn.Linear), 无法注入 LoRA;
++                # 对 MLA 注意力线性层与共享专家注入 (gate/up/down_proj 仅命中 shared_experts)。
++                # 注: o_a_proj 为 GroupedLinear (输入为 5D 分组张量), PEFT LoRA 的秩推断与
++                # 加法残差不兼容, 故排除; o_b_proj 覆盖输出投影的适配能力
++                lora_config = LoraConfig(
++                    task_type="CAUSAL_LM",
++                    r=args.lora_rank,
++                    lora_alpha=args.lora_alpha,
++                    target_modules=["q_a_proj", "q_b_proj", "kv_proj", "o_b_proj",
++                                    "gate_proj", "up_proj", "down_proj"],
++                )
+             else:
+                 lora_config = LoraConfig(task_type="CAUSAL_LM", r=args.lora_rank, lora_alpha=args.lora_alpha)
+             model = booster.enable_lora(model, lora_config=lora_config)
+@@ -257,7 +310,7 @@ def train(args) -> None:
+     )
+ 
+     torch.set_default_dtype(torch.float)
+-    booster.load_model(model, args.pretrained, low_cpu_mem_mode=False, num_threads=8)
++    booster.load_model(model, args.pretrained, low_cpu_mem_mode=args.low_cpu_mem, num_threads=8)
+ 
+     coordinator.print_on_master(
+         f"Booster init max device memory: {accelerator.max_memory_allocated() / 1024 ** 2:.2f} MB"
+@@ -441,6 +494,14 @@ if __name__ == "__main__":
+     parser.add_argument(
+         "--zero_cpu_offload", default=False, action="store_true", help="Whether to use offloading, used for 3d plugin."
+     )
++    parser.add_argument(
++        "--low_cpu_mem",
++        default=False,
++        action="store_true",
++        help="Stream-load checkpoint to keep peak CPU memory low (required for 284B+ models).",
++    )
++    parser.add_argument("--system_prompt", type=str, default="", help="System prompt prepended to conversations.")
++    parser.add_argument("--use_fp8", default=False, action="store_true", help="Enable FP8 mixed-precision training (moe plugin).")
+     parser.add_argument(
+         "--microbatch_size", type=int, default=1, help="Batch size for each process in PP, used for 3d plugin."
+     )
+diff --git a/applications/ColossalChat/examples/training_scripts/train_dpo.py b/applications/ColossalChat/examples/training_scripts/train_dpo.py
+index ad81db7..f2e8d4d 100755
+--- a/applications/ColossalChat/examples/training_scripts/train_dpo.py
++++ b/applications/ColossalChat/examples/training_scripts/train_dpo.py
+@@ -69,6 +69,22 @@ def train(args):
+             cpu_offload=True,
+             max_norm=args.grad_clip,
+         )
++    elif args.plugin == "moe":
++        from colossalai.booster.plugin import MoeHybridParallelPlugin
++
++        plugin = MoeHybridParallelPlugin(
++            ep_size=args.ep,
++            tp_size=args.tp,
++            pp_size=args.pp,
++            zero_stage=args.zero_stage,
++            cpu_offload=args.zero_cpu_offload,
++            sp_size=args.sp,
++            sequence_parallelism_mode=args.sp_mode,
++            enable_sequence_parallelism=args.sp > 1,
++            max_norm=args.grad_clip,
++            precision=args.mixed_precision,
++            microbatch_size=args.microbatch_size,
++        )
+     elif args.plugin == "3d":
+         plugin = HybridParallelPlugin(
+             tp_size=args.tp,
+@@ -101,27 +117,45 @@ def train(args):
+     )
+     ref_booster = Booster(plugin=ref_plugin)
+ 
+-    init_ctx = nullcontext()
++    # 284B 适配: 懒初始化构建空壳模型, 权重由 booster.load_model 低内存流式加载;
++    # 参考模型仅在未禁用时以同样方式构建 (大模型推荐 --disable_reference_model + SimPO)
++    from colossalai.lazy import LazyInitContext
++    from colossalai.utils import get_current_device
++    from transformers import AutoConfig
++
++    config = AutoConfig.from_pretrained(args.pretrain, trust_remote_code=True)
++    # 预热导入模型模块: 懒初始化内首次导入会因 `X | None` 注解求值崩溃 (同 lora_finetune)
++    _ = AutoModelForCausalLM._model_mapping[type(config)]
++    # DeepSeek-V4 head_dim=512 仅支持 eager 注意力
++    attn_impl = "eager" if config.model_type == "deepseek_v4" else ("flash_attention_2" if args.use_flash_attn else "eager")
++    # HybridParallel(3d) 与 Gemini 均支持懒初始化; zero2/ddp 直接物化
++    init_ctx = LazyInitContext(default_device=get_current_device()) if args.plugin in ("gemini", "3d", "moe") else nullcontext()
+     with init_ctx:
+-        if args.use_flash_attn:
+-            model = AutoModelForCausalLM.from_pretrained(
+-                args.pretrain,
+-                torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
+-                use_flash_attention_2=True,
+-            )
+-            coordinator.print_on_master(msg="Flash-attention enabled successfully")
+-        else:
+-            model = AutoModelForCausalLM.from_pretrained(args.pretrain)
++        model = AutoModelForCausalLM.from_config(
++            config,
++            trust_remote_code=True,
++            attn_implementation=attn_impl,
++            torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
++        )
++        # transformers 5.x RotaryEmbedding 懒链自引用环修复 (同 lora_finetune)
++        from lora_finetune import _fix_lazy_rotary_buffers
++
++        _fix_lazy_rotary_buffers(model)
++
++        # moe 插件 EP 路线: 融合专家转逐专家布局 (逐专家键加载, 每 rank 持 1/ep)
++        if args.plugin == "moe" and args.ep > 1:
++            from colossalai.shardformer.modeling.deepseek_v4 import convert_fused_experts_to_modulelist
++
++            convert_fused_experts_to_modulelist(model)
+ 
+         if not args.disable_reference_model:
+-            if args.use_flash_attn:
+-                ref_model = AutoModelForCausalLM.from_pretrained(
+-                    args.pretrain,
++            with init_ctx:
++                ref_model = AutoModelForCausalLM.from_config(
++                    config,
++                    trust_remote_code=True,
++                    attn_implementation=attn_impl,
+                     torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
+-                    use_flash_attention_2=True,
+                 )
+-            else:
+-                ref_model = AutoModelForCausalLM.from_pretrained(args.pretrain)
+         else:
+             ref_model = None
+ 
+@@ -131,7 +165,8 @@ def train(args):
+                 if "norm" in name or "gate" in name:
+                     module = module.to(torch.float32)
+         disable_dropout(model)
+-        disable_dropout(ref_model)
++        if ref_model is not None:
++            disable_dropout(ref_model)
+ 
+     if args.grad_checkpoint:
+         # Make sure gradient checkpointing can be activated.
+@@ -217,10 +252,17 @@ def train(args):
+         lr_scheduler=lr_scheduler,
+         dataloader=train_dataloader,
+     )
+-    ref_model, _, _, _, _ = ref_booster.boost(model=ref_model)
++    if ref_model is not None:
++        ref_model, _, _, _, _ = ref_booster.boost(model=ref_model)
+ 
+     torch.set_default_dtype(torch.float)
+ 
++    # 低内存流式加载预训练权重 (284B bf16=568GB, 常规加载会 OOM)
++    coordinator.print_on_master(f"Loading pretrained weights from {args.pretrain} ...")
++    booster.load_model(model, args.pretrain, low_cpu_mem_mode=True, num_threads=8)
++    if ref_model is not None:
++        ref_booster.load_model(ref_model, args.pretrain, low_cpu_mem_mode=True, num_threads=8)
++
+     coordinator.print_on_master(f"Booster init max CUDA memory: {torch.cuda.max_memory_allocated() / 1024 ** 2:.2f} MB")
+     coordinator.print_on_master(
+         f"Booster init max CPU memory: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.2f} MB"
+@@ -310,13 +352,14 @@ if __name__ == "__main__":
+         "--plugin",
+         type=str,
+         default="gemini",
+-        choices=["gemini", "zero2", "zero2_cpu", "3d", "ddp"],
++        choices=["gemini", "zero2", "zero2_cpu", "3d", "ddp", "moe"],
+         help="Choose which plugin to use",
+     )
+     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
+     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+     parser.add_argument("--warmup_steps", type=int, default=None, help="Warmup steps")
+     parser.add_argument("--tp", type=int, default=1)
++    parser.add_argument("--ep", type=int, default=1, help="EP size, used for moe plugin.")
+     parser.add_argument("--pp", type=int, default=1)
+     parser.add_argument("--sp", type=int, default=1)
+     parser.add_argument("--loss_type", type=str, default="dpo_loss", help="dpo_loss or simpo_loss")
+diff --git a/applications/ColossalChat/examples/training_scripts/train_orpo.py b/applications/ColossalChat/examples/training_scripts/train_orpo.py
+index 0f2fbfa..2777129 100755
+--- a/applications/ColossalChat/examples/training_scripts/train_orpo.py
++++ b/applications/ColossalChat/examples/training_scripts/train_orpo.py
+@@ -79,6 +79,22 @@ def train(args):
+             cpu_offload=True,
+             max_norm=args.grad_clip,
+         )
++    elif args.plugin == "moe":
++        from colossalai.booster.plugin import MoeHybridParallelPlugin
++
++        plugin = MoeHybridParallelPlugin(
++            ep_size=args.ep,
++            tp_size=args.tp,
++            pp_size=args.pp,
++            zero_stage=args.zero_stage,
++            cpu_offload=args.zero_cpu_offload,
++            sp_size=args.sp,
++            sequence_parallelism_mode=args.sp_mode,
++            enable_sequence_parallelism=args.sp > 1,
++            max_norm=args.grad_clip,
++            precision=args.mixed_precision,
++            microbatch_size=args.microbatch_size,
++        )
+     elif args.plugin == "3d":
+         plugin = HybridParallelPlugin(
+             tp_size=args.tp,
+@@ -106,17 +122,33 @@ def train(args):
+     #     LazyInitContext(default_device=get_current_device()) if isinstance(plugin, (GeminiPlugin,)) else nullcontext()
+     # )
+ 
+-    init_ctx = nullcontext()
++    # 284B 适配: 懒初始化空壳 + booster.load_model 低内存流式加载 (同 train_dpo)
++    from colossalai.lazy import LazyInitContext
++    from colossalai.utils import get_current_device
++    from transformers import AutoConfig
++
++    config = AutoConfig.from_pretrained(args.pretrain, trust_remote_code=True)
++    # 预热导入模型模块: 懒初始化内首次导入会因 `X | None` 注解求值崩溃
++    _ = AutoModelForCausalLM._model_mapping[type(config)]
++    attn_impl = "eager" if config.model_type == "deepseek_v4" else ("flash_attention_2" if args.use_flash_attn else "eager")
++    init_ctx = LazyInitContext(default_device=get_current_device()) if args.plugin in ("gemini", "gemini_auto", "3d", "moe") else nullcontext()
+     with init_ctx:
+-        if args.use_flash_attn:
+-            model = AutoModelForCausalLM.from_pretrained(
+-                args.pretrain,
+-                torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
+-                use_flash_attention_2=True,
+-            )
+-            coordinator.print_on_master(msg="Flash-attention enabled successfully")
+-        else:
+-            model = AutoModelForCausalLM.from_pretrained(args.pretrain)
++        model = AutoModelForCausalLM.from_config(
++            config,
++            trust_remote_code=True,
++            attn_implementation=attn_impl,
++            torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
++        )
++        from lora_finetune import _fix_lazy_rotary_buffers
++
++        _fix_lazy_rotary_buffers(model)
++
++        # moe 插件 EP 路线: 融合专家转逐专家布局 (逐专家键加载, 每 rank 持 1/ep)
++        if args.plugin == "moe" and args.ep > 1:
++            from colossalai.shardformer.modeling.deepseek_v4 import convert_fused_experts_to_modulelist
++
++            convert_fused_experts_to_modulelist(model)
++
+         if args.lora_config is not None:
+             model = convert_to_lora_module(model, lora_config=lora_config)
+             for name, module in model.named_modules():
+@@ -207,6 +239,10 @@ def train(args):
+     )
+     torch.set_default_dtype(torch.float)
+ 
++    # 低内存流式加载预训练权重 (284B bf16=568GB)
++    coordinator.print_on_master(f"Loading pretrained weights from {args.pretrain} ...")
++    booster.load_model(model, args.pretrain, low_cpu_mem_mode=True, num_threads=8)
++
+     coordinator.print_on_master(f"Booster init max CUDA memory: {torch.cuda.max_memory_allocated() / 1024 ** 2:.2f} MB")
+     coordinator.print_on_master(
+         f"Booster init max CPU memory: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.2f} MB"
+@@ -293,13 +329,15 @@ if __name__ == "__main__":
+         "--plugin",
+         type=str,
+         default="gemini",
+-        choices=["gemini", "gemini_auto", "zero2", "zero2_cpu", "3d"],
++        choices=["gemini", "gemini_auto", "zero2", "zero2_cpu", "3d", "moe"],
+         help="Choose which plugin to use",
+     )
+     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
+     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+     parser.add_argument("--warmup_steps", type=int, default=None, help="Warmup steps")
+     parser.add_argument("--tp", type=int, default=1)
++    parser.add_argument("--ep", type=int, default=1, help="EP size, used for moe plugin.")
++    parser.add_argument("--microbatch_size", type=int, default=1, help="Microbatch size for PP, used for 3d/moe plugin.")
+     parser.add_argument("--pp", type=int, default=1)
+     parser.add_argument("--sp", type=int, default=1)
+     parser.add_argument("--lam", type=float, default=0.1, help="lambda in ORPO loss")
+diff --git a/colossalai/checkpoint_io/utils.py b/colossalai/checkpoint_io/utils.py
+index 4b36dbe..fdc9a61 100644
+--- a/colossalai/checkpoint_io/utils.py
++++ b/colossalai/checkpoint_io/utils.py
+@@ -1140,6 +1140,8 @@ def gather_state_dict_fast(
+                 buffer = torch.empty(shape, dtype=dtype, device=get_current_device())
+                 returned_state_dict[k] = buffer
+                 ops.append(dist.P2POp(dist.irecv, buffer, dist.get_global_rank(group, i), group))
++            if not ops:
++                continue  # 该 rank 无专家状态 (如 LoRA 未注入路由专家), 两端对称跳过
+             reqs = dist.batch_isend_irecv(ops)
+             for req, (k, *_) in zip(reqs, target_metadata):
+                 req.wait()
+@@ -1150,6 +1152,7 @@ def gather_state_dict_fast(
+         ops = []
+         for k, *_ in metadata:
+             ops.append(dist.P2POp(dist.isend, state_dict[k], dist.get_global_rank(group, dst), group))
+-        reqs = dist.batch_isend_irecv(ops)
+-        for req in reqs:
+-            req.wait()
++        if ops:
++            reqs = dist.batch_isend_irecv(ops)
++            for req in reqs:
++                req.wait()
+diff --git a/colossalai/shardformer/modeling/deepseek_v4.py b/colossalai/shardformer/modeling/deepseek_v4.py
+new file mode 100644
+index 0000000..1ec32df
+--- /dev/null
++++ b/colossalai/shardformer/modeling/deepseek_v4.py
+@@ -0,0 +1,268 @@
++# Adaptation of Shardformer MoE expert parallelism for DeepSeek-V4 (transformers >= 5.x)
++#
++# Differences vs DeepseekV3:
++# - transformers 5.x stores experts as fused 3D tensors (gate_up_proj / down_proj)
++#   in `DeepseekV4Experts`, instead of a ModuleList of expert MLPs.
++# - The MoE block forward takes an extra `input_ids` argument (hash router layers).
++#
++# This module wraps a native DeepseekV4SparseMoeBlock, slices the expert tensors
++# along the expert dimension across the EP group, and implements all-to-all based
++# token dispatch/combine (same scheme as EpDeepseekV3MoE).
++
++from typing import Optional
++
++import torch
++import torch.distributed as dist
++import torch.nn as nn
++import torch.nn.functional as F
++from torch.distributed import ProcessGroup
++from torch.nn import Module
++
++from colossalai.lazy import LazyInitContext
++from colossalai.moe._operation import (
++    DPGradScalerIn,
++    DPGradScalerOut,
++    EPGradScalerIn,
++    EPGradScalerOut,
++    all_to_all_uneven,
++)
++from colossalai.shardformer.layer.linear import ParallelModule
++from colossalai.tensor.moe_tensor.api import set_moe_tensor_ep_group
++
++
++class V4Expert(nn.Module):
++    """单个专家 (gate/up/down), 参数形状与融合张量的单专家切片一致。"""
++
++    def __init__(self, hidden_dim: int, intermediate_dim: int, act_fn, limit: float, dtype=None):
++        super().__init__()
++        # 注意: 在 LazyInitContext 内创建时, torch.empty 被拦截为懒初始化;
++        # dtype 必须与融合权重一致 (否则 F.linear dtype mismatch)
++        self.gate_up_proj = nn.Parameter(torch.empty(2 * intermediate_dim, hidden_dim, dtype=dtype))
++        self.down_proj = nn.Parameter(torch.empty(hidden_dim, intermediate_dim, dtype=dtype))
++        self.act_fn = act_fn
++        self.limit = limit
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        gate_up = F.linear(x, self.gate_up_proj)
++        gate, up = gate_up.chunk(2, dim=-1)
++        gate = gate.clamp(max=self.limit)
++        up = up.clamp(min=-self.limit, max=self.limit)
++        return F.linear(self.act_fn(gate) * up, self.down_proj)
++
++
++class V4ExpertsList(nn.Module):
++    """逐专家 ModuleList 形式的专家集合 (替代融合 3D 张量), 便于专家并行切分与按需加载。"""
++
++    def __init__(self, fused):
++        super().__init__()
++        self.num_experts = fused.num_experts
++        self.hidden_dim = fused.hidden_dim
++        self.intermediate_dim = fused.intermediate_dim
++        self.act_fn = fused.act_fn
++        self.limit = fused.limit
++        self.experts = nn.ModuleList(
++            [
++                V4Expert(self.hidden_dim, self.intermediate_dim, self.act_fn, self.limit,
++                         dtype=fused.gate_up_proj.dtype)
++                for _ in range(self.num_experts)
++            ]
++        )
++
++    def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
++        # 无专家并行时的朴素实现 (逐专家循环), 训练路径使用 EpDeepseekV4MoE
++        final = torch.zeros_like(hidden_states)
++        for e, expert in enumerate(self.experts):
++            mask = top_k_index == e
++            if not mask.any():
++                continue
++            token_idx, pos = mask.nonzero(as_tuple=True)
++            out = expert(hidden_states[token_idx]) * top_k_weights[token_idx, pos, None]
++            final.index_add_(0, token_idx, out.to(final.dtype))
++        return final
++
++
++def convert_fused_experts_to_modulelist(model: nn.Module, copy_weights: bool = True) -> None:
++    """将 DeepseekV4Experts (融合 3D 参数) 原地替换为 V4ExpertsList。
++
++    训练路径: 在 LazyInitContext 内调用, 新参数经 torch.empty 懒初始化,
++    权重由逐专家键的 checkpoint 加载, 使专家并行只加载/保存本 rank 的 1/ep 专家。
++    copy_weights: 融合参数已物化时是否拷贝权重到逐专家参数 (懒张量时自动跳过)。
++    """
++    from colossalai.lazy.lazy_init import LazyTensor
++
++    for layer in model.model.layers:
++        mlp = layer.mlp
++        if mlp.experts.__class__.__name__ == "DeepseekV4Experts":
++            fused = mlp.experts
++            new_experts = V4ExpertsList(fused)
++            if copy_weights and not isinstance(fused.gate_up_proj, LazyTensor):
++                with torch.no_grad():
++                    for e in range(fused.num_experts):
++                        new_experts.experts[e].gate_up_proj.copy_(fused.gate_up_proj[e])
++                        new_experts.experts[e].down_proj.copy_(fused.down_proj[e])
++            mlp.experts = new_experts
++
++
++class EpDeepseekV4MoE(ParallelModule):
++    """Expert-parallel DeepSeek-V4 Sparse MoE block."""
++
++    def __init__(self, config):
++        raise RuntimeError(f"Please use `from_native_module` to create an instance of {self.__class__.__name__}")
++
++    def setup_process_groups(self, moe_dp_group: ProcessGroup, ep_group: ProcessGroup):
++        assert moe_dp_group is not None
++        assert ep_group is not None
++
++        self.ep_size = dist.get_world_size(ep_group)
++        self.ep_rank = dist.get_rank(ep_group)
++        self.num_experts = self.experts.num_experts
++        assert self.num_experts % self.ep_size == 0, "num_experts must be divisible by ep_size"
++
++        self.ep_group = ep_group
++        self.num_experts_per_ep = self.num_experts // self.ep_size
++        self.experts_per_rank = self.num_experts_per_ep
++        self.expert_start_idx = self.ep_rank * self.num_experts_per_ep
++
++        # 逐专家 ModuleList: 仅保留本 rank 持有的专家, 其余参数置 None (自包含实现,
++        # 不使用 set_tensors_to_none, 避免其递归影响 gate 等其他参数),
++        # 使物化与权重加载只覆盖 1/ep 的专家, 实现真正的专家显存切分
++        # 注意: 保持 ModuleList 的全局索引布局 (梯度规约按全局专家号), 仅置空非持有专家参数
++        held = set(range(self.expert_start_idx, self.expert_start_idx + self.num_experts_per_ep))
++        for i, expert in enumerate(self.experts.experts):
++            if i in held:
++                continue
++            for pname in list(expert._parameters.keys()):
++                expert._parameters[pname] = None
++
++        # setup moe_dp group
++        self.moe_dp_group = moe_dp_group
++        self.moe_dp_size = dist.get_world_size(moe_dp_group)
++
++        for p in self.experts.parameters():
++            set_moe_tensor_ep_group(p, ep_group)
++
++    @staticmethod
++    def from_native_module(module: Module, moe_dp_group: ProcessGroup, ep_group: ProcessGroup, *args, **kwargs):
++        # 鸭子类型: 需要 gate / experts(V4ExpertsList) / shared_experts 结构
++        assert hasattr(module, "gate") and hasattr(module, "experts") and hasattr(module, "shared_experts"), (
++            f"EpDeepseekV4MoE expects a SparseMoE-block-like module, got {module.__class__.__name__}"
++        )
++        assert module.experts.__class__.__name__ == "V4ExpertsList", (
++            "请先调用 convert_fused_experts_to_modulelist(model) 将融合专家转为逐专家布局"
++        )
++        if module.__class__ is not EpDeepseekV4MoE:
++            module.__class__ = EpDeepseekV4MoE
++            module.setup_process_groups(moe_dp_group, ep_group)
++        LazyInitContext.materialize(module)
++        return module
++
++    def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
++        batch, seq_len, hidden_dim = hidden_states.shape
++        residual = hidden_states
++        flat = hidden_states.view(-1, hidden_dim)
++        if self.is_hash:
++            # hash router needs token-level input_ids aligned with flattened hidden states;
++            # 打包/不对齐时回退为 topk 打分 (保证训练不崩, 该 3 层路由退化为可学习形式)
++            ids = input_ids.reshape(-1) if input_ids is not None else None
++            if ids is not None and ids.numel() == flat.shape[0]:
++                _, weights, indices = self.gate(hidden_states, ids)
++            else:
++                logits = torch.nn.functional.linear(flat, self.gate.weight)
++                scores = self.gate.score_fn(logits)
++                indices = torch.topk(scores, self.gate.top_k, dim=-1, sorted=False).indices
++                weights = scores.gather(1, indices)
++                weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
++                weights = weights * self.gate.routed_scaling_factor
++        else:
++            _, weights, indices = self.gate(hidden_states)
++        routed = self.ep_experts_forward(flat, indices, weights).view(batch, seq_len, hidden_dim)
++        return routed + self.shared_experts(residual)
++
++    def _expert_forward(self, x: torch.Tensor, e: int) -> torch.Tensor:
++        """单个专家计算: e 为局部专家下标, 存储位置为全局专家号, x [n, H] -> [n, H]"""
++        return self.experts.experts[e + self.expert_start_idx](x)
++
++    def ep_experts_forward(
++        self, x: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
++    ) -> torch.Tensor:
++        """All-to-all expert-parallel MoE computation. x: [T, H] flattened tokens."""
++        num_tokens = x.shape[0]
++        k = top_k_index.shape[-1]
++        device = x.device
++
++        # token counts per global expert
++        counts = torch.bincount(top_k_index.reshape(-1), minlength=self.num_experts)
++
++        if self.ep_size > 1:
++            counts_grouped = counts.view(self.ep_size, self.experts_per_rank).sum(dim=1)
++            recv_counts = torch.empty_like(counts_grouped)
++            dist.all_to_all_single(recv_counts, counts_grouped, group=self.ep_group)
++            send_splits = counts_grouped.tolist()
++            recv_splits = recv_counts.tolist()
++        else:
++            recv_counts = counts
++            send_splits = recv_splits = [int(num_tokens)]
++
++        # sort tokens by (global expert id)
++        flat_idx = top_k_index.reshape(-1)
++        sort_order = flat_idx.argsort(stable=True)
++        sorted_tokens = x[sort_order // k]
++        sorted_expert = flat_idx[sort_order]
++
++        if self.ep_size > 1:
++            # dispatch tokens to owning EP ranks
++            gathered, _ = all_to_all_uneven(sorted_tokens, send_splits, recv_splits, self.ep_group)
++            expert_gathered, _ = all_to_all_uneven(sorted_expert.unsqueeze(-1), send_splits, recv_splits, self.ep_group)
++            expert_gathered = expert_gathered.squeeze(-1) - self.expert_start_idx  # local expert id
++
++            # group received tokens by local expert
++            local_order = expert_gathered.argsort(stable=True)
++            gathered = gathered[local_order]
++            local_counts = torch.bincount(expert_gathered, minlength=self.experts_per_rank)
++
++            # moe-dp: 本 rank 局部专家的激活情况 (跨 DP 组规约), 供梯度缩放
++            activate_experts = (local_counts > 0).int()
++            dist.all_reduce(activate_experts, group=self.moe_dp_group)
++
++            gathered = EPGradScalerIn.apply(gathered, self.ep_size)
++        else:
++            local_counts = counts
++            activate_experts = None
++            gathered = sorted_tokens
++
++        # per-local-expert grouped computation
++        outputs = []
++        start = 0
++        for e in range(self.experts_per_rank):
++            n = int(local_counts[e])
++            if n == 0:
++                continue
++            toks = gathered[start : start + n]
++            if self.ep_size > 1:
++                toks = DPGradScalerIn.apply(toks, self.moe_dp_size, activate_experts[e])
++            out_e = self._expert_forward(toks, e)  # [n, H]
++            if self.ep_size > 1:
++                out_e = DPGradScalerOut.apply(out_e, self.moe_dp_size, activate_experts[e])
++            outputs.append(out_e)
++            start += n
++
++        if outputs:
++            local_out = torch.cat(outputs, dim=0)
++        else:
++            local_out = gathered[:0]
++
++        if self.ep_size > 1:
++            local_out = EPGradScalerOut.apply(local_out, self.ep_size)
++            # combine: scatter results back to source ranks (与 dispatch 相反的拆分)
++            combined, _ = all_to_all_uneven(local_out, recv_splits, send_splits, self.ep_group)
++            # combined 已恢复为 sorted-token 顺序, 按路由权重加权
++            w = top_k_weights.reshape(-1)[sort_order]
++            final_sorted = combined * w[:, None]
++        else:
++            w = top_k_weights.reshape(-1)[sort_order]
++            final_sorted = local_out * w[:, None]
++
++        # 恢复原始 token 顺序 (同一 token 的 k 个专家输出累加)
++        final = torch.zeros(num_tokens, x.shape[-1], dtype=final_sorted.dtype, device=device)
++        final.index_add_(0, sort_order // k, final_sorted)
++        return final
+diff --git a/colossalai/shardformer/policies/auto_policy.py b/colossalai/shardformer/policies/auto_policy.py
+index 3d61af1..2354a33 100644
+--- a/colossalai/shardformer/policies/auto_policy.py
++++ b/colossalai/shardformer/policies/auto_policy.py
+@@ -174,6 +174,13 @@ _POLICY_LIST = {
+     "transformers_modules.modeling_deepseek.DeepseekV3ForCausalLM": PolicyLocation(
+         file_name="deepseek_v3", class_name="DeepseekV3ForCausalLMPolicy"
+     ),
++    # DeepseekV4 (native in transformers >= 5.x)
++    "transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Model": PolicyLocation(
++        file_name="deepseek_v4", class_name="DeepseekV4ModelPolicy"
++    ),
++    "transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4ForCausalLM": PolicyLocation(
++        file_name="deepseek_v4", class_name="DeepseekV4ForCausalLMPolicy"
++    ),
+     # Falcon
+     "transformers.models.falcon.modeling_falcon.FalconModel": PolicyLocation(
+         file_name="falcon", class_name="FalconModelPolicy"
+diff --git a/colossalai/shardformer/policies/deepseek_v4.py b/colossalai/shardformer/policies/deepseek_v4.py
+new file mode 100644
+index 0000000..5c38377
+--- /dev/null
++++ b/colossalai/shardformer/policies/deepseek_v4.py
+@@ -0,0 +1,89 @@
++# Shardformer policy for DeepSeek-V4 (transformers >= 5.x native implementation).
++# Modeled after policies/deepseek_v3.py; pipeline parallelism is not supported yet
++# (transformers 5.x V4 forward signature differs), EP + ZeRO/CPU-offload is the target.
++
++from typing import Dict, List, Union
++
++import torch.nn as nn
++
++from colossalai.shardformer.layer import FusedRMSNorm
++from colossalai.shardformer.modeling.deepseek_v4 import EpDeepseekV4MoE
++from colossalai.shardformer.policies.base_policy import ModulePolicyDescription, Policy, SubModuleReplacementDescription
++
++__all__ = ["DeepseekV4Policy", "DeepseekV4ModelPolicy", "DeepseekV4ForCausalLMPolicy"]
++
++
++class DeepseekV4Policy(Policy):
++    def config_sanity_check(self):
++        assert not self.shard_config.enable_tensor_parallelism, "DeepSeekV4 does not support tensor parallelism"
++        assert not self.shard_config.enable_sequence_parallelism, "DeepSeekV4 does not support sequence parallelism"
++        assert self.shard_config.pipeline_stage_manager is None, (
++            "DeepSeekV4 does not support pipeline parallelism yet"
++        )
++
++    def preprocess(self):
++        return self.model
++
++    def module_policy(self) -> Dict[Union[str, nn.Module], ModulePolicyDescription]:
++        policy = {}
++
++        if self.shard_config.expert_parallel_size > 1:
++            # expert parallel: replace the Sparse MoE block (suffix "mlp" of decoder layer)
++            self.append_or_create_submodule_replacement(
++                description=[
++                    SubModuleReplacementDescription(
++                        suffix="mlp",
++                        target_module=EpDeepseekV4MoE,
++                        kwargs={
++                            "ep_group": self.shard_config.ep_group,
++                            "moe_dp_group": self.shard_config.moe_dp_group,
++                        },
++                    )
++                ],
++                policy=policy,
++                target_key="DeepseekV4DecoderLayer",
++            )
++
++        # optimization configuration
++        if self.shard_config.enable_fused_normalization:
++            self.append_or_create_submodule_replacement(
++                description=[
++                    SubModuleReplacementDescription(
++                        suffix="input_layernorm",
++                        target_module=FusedRMSNorm,
++                    ),
++                    SubModuleReplacementDescription(
++                        suffix="post_attention_layernorm",
++                        target_module=FusedRMSNorm,
++                    ),
++                ],
++                policy=policy,
++                target_key="DeepseekV4DecoderLayer",
++            )
++
++            self.append_or_create_submodule_replacement(
++                description=SubModuleReplacementDescription(
++                    suffix="norm",
++                    target_module=FusedRMSNorm,
++                ),
++                policy=policy,
++                target_key="DeepseekV4Model",
++            )
++
++        return policy
++
++    def postprocess(self):
++        return self.model
++
++    def get_held_layers(self) -> List[nn.Module]:
++        raise NotImplementedError("DeepSeekV4 does not support pipeline parallelism yet")
++
++
++class DeepseekV4ModelPolicy(DeepseekV4Policy):
++    def module_policy(self):
++        return super().module_policy()
++
++
++class DeepseekV4ForCausalLMPolicy(DeepseekV4Policy):
++    def module_policy(self):
++        return super().module_policy()

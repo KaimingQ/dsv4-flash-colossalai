@@ -1,0 +1,11 @@
+# 大文件与产物
+data/*.jsonl
+data/*.arrow
+data/*.parquet
+logs/
+output/
+__pycache__/
+*.pyc
+nohup.out
+third_party/
+training_config.json
