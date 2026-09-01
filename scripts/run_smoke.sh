@@ -14,6 +14,8 @@ SMOKE_DATA=data/sft_smoke.jsonl
 
 TRAIN_SCRIPT=third_party/ColossalAI/applications/ColossalChat/examples/training_scripts/lora_finetune.py
 
+NO_FUSED_NORM=${NO_FUSED_NORM:-}
+
 colossalai run --nproc_per_node 8 "${TRAIN_SCRIPT}" \
     --pretrained "${MODEL}" \
     --dataset "${SMOKE_DATA}" \
@@ -21,6 +23,7 @@ colossalai run --nproc_per_node 8 "${TRAIN_SCRIPT}" \
     --ep 8 \
     --zero_stage 1 \
     ${OFFLOAD:+--zero_cpu_offload} \
+    ${NO_FUSED_NORM:+--no_fused_norm} \
     --low_cpu_mem \
     --mixed_precision bf16 \
     --lr 2e-5 \

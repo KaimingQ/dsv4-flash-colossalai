@@ -127,10 +127,10 @@ index 1de9f52..fdd8c9c 100644
                      logprob_actor_chosen, logprob_actor_reject, chosen_loss_mask[:, 1:], reject_loss_mask[:, 1:]
                  )
 diff --git a/applications/ColossalChat/examples/training_scripts/lora_finetune.py b/applications/ColossalChat/examples/training_scripts/lora_finetune.py
-index 4045556..24b7b26 100644
+index 4045556..ce85db2 100644
 --- a/applications/ColossalChat/examples/training_scripts/lora_finetune.py
 +++ b/applications/ColossalChat/examples/training_scripts/lora_finetune.py
-@@ -36,6 +36,30 @@ from colossalai.nn.optimizer import HybridAdam
+@@ -36,11 +36,70 @@ from colossalai.nn.optimizer import HybridAdam
  from colossalai.utils import get_current_device
  
  
@@ -158,10 +158,86 @@ index 4045556..24b7b26 100644
 +                mod.register_buffer(n, v, persistent=False)
 +
 +
++def _keep_strict_fp32(model) -> None:
++    """复现 HF from_pretrained 的 _keep_in_fp32_modules_strict 精度策略。
++
++    from_config 按传入 dtype 创建全部参数, 而 checkpoint 中 hc/sinks/norm 等
++    敏感模块以 fp32 存储; bf16 量化会引入可观测的数值偏移 (实测基线 NLL 0.8
++    变为 6+)。此处将这些参数/buffer 重建为 fp32 懒张量, 后续加载保持无损。
++    """
++    keywords = getattr(model, "_keep_in_fp32_modules_strict", None)
++    if not keywords:
++        return
++
++    def keep_fp32(name: str) -> bool:
++        return any(name == kw or name.endswith("." + kw) for kw in keywords)
++
++    for n, mod in model.named_modules():
++        for pname, p in list(mod.named_parameters(recurse=False)):
++            full = f"{n}.{pname}" if n else pname
++            if keep_fp32(full) and p.dtype != torch.float32:
++                setattr(mod, pname, torch.nn.Parameter(
++                    torch.empty(p.shape, dtype=torch.float32, device=p.device),
++                    requires_grad=p.requires_grad,
++                ))
++        for bname, b in list(mod.named_buffers(recurse=False)):
++            full = f"{n}.{bname}" if n else bname
++            if keep_fp32(full) and b is not None and b.dtype != torch.float32:
++                mod.register_buffer(
++                    bname,
++                    torch.empty(b.shape, dtype=torch.float32, device=b.device),
++                    persistent=(bname not in mod._non_persistent_buffers_set),
++                )
++
++
  def all_reduce_mean(loss: torch.Tensor, plugin: Plugin) -> torch.Tensor:
      loss = loss.data
      group = getattr(plugin, "dp_group", None)
-@@ -111,6 +135,7 @@ def train(args) -> None:
+     dist.all_reduce(loss, group=group)
+-    return loss / dist.get_world_size(group)
++    # 原地除以组大小: 调用方 (如 SFT 分支) 直接复用该张量, 若只返回商不原地除,
++    # 报告的 loss 会误为全组之和 (曾导致报告值偏大 world_size 倍)
++    loss.div_(dist.get_world_size(group))
++    return loss
+ 
+ 
+ def train(args) -> None:
+@@ -50,6 +109,7 @@ def train(args) -> None:
+     colossalai.launch_from_torch()
+     accelerator = get_accelerator()
+     coordinator = DistCoordinator()
++    fused_norm = accelerator.is_available() and not args.no_fused_norm
+ 
+     # ==============================
+     # Initialize Booster
+@@ -62,7 +122,7 @@ def train(args) -> None:
+             initial_scale=2**16,
+             max_norm=args.grad_clip,
+             enable_gradient_accumulation=(args.accumulation_steps > 1),
+-            enable_fused_normalization=get_accelerator().is_available(),
++            enable_fused_normalization=fused_norm,
+             enable_flash_attention=args.use_flash_attn,
+         )
+     elif args.plugin == "gemini_auto":
+@@ -72,7 +132,7 @@ def train(args) -> None:
+             initial_scale=2**16,
+             max_norm=args.grad_clip,
+             enable_gradient_accumulation=(args.accumulation_steps > 1),
+-            enable_fused_normalization=get_accelerator().is_available(),
++            enable_fused_normalization=fused_norm,
+             enable_flash_attention=args.use_flash_attn,
+         )
+     elif args.plugin == "zero2":
+@@ -98,7 +158,7 @@ def train(args) -> None:
+             sequence_parallelism_mode=args.sp_mode,
+             zero_stage=args.zero_stage,
+             enable_flash_attention=args.use_flash_attn,
+-            enable_fused_normalization=get_accelerator().is_available(),
++            enable_fused_normalization=fused_norm,
+             enable_sequence_parallelism=args.enable_sequence_parallelism,
+             cpu_offload=True if args.zero_stage >= 1 and args.zero_cpu_offload else False,
+             max_norm=args.grad_clip,
+@@ -111,10 +171,11 @@ def train(args) -> None:
              tp_size=args.tp,
              pp_size=args.pp,
              zero_stage=args.zero_stage,
@@ -169,7 +245,12 @@ index 4045556..24b7b26 100644
              sp_size=args.sp,
              sequence_parallelism_mode=args.sp_mode,
              enable_sequence_parallelism=args.sp > 1,
-@@ -157,6 +182,7 @@ def train(args) -> None:
+-            enable_fused_normalization=get_accelerator().is_available(),
++            enable_fused_normalization=fused_norm,
+             enable_flash_attention=args.use_flash_attn,
+             max_norm=args.grad_clip,
+             precision=args.mixed_precision,
+@@ -157,6 +218,7 @@ def train(args) -> None:
          tokenizer,
          args.dataset,
          args.max_length,
@@ -177,7 +258,7 @@ index 4045556..24b7b26 100644
      )
  
      dataloader = plugin.prepare_dataloader(
-@@ -179,9 +205,12 @@ def train(args) -> None:
+@@ -179,9 +241,12 @@ def train(args) -> None:
          if isinstance(plugin, (GeminiPlugin, HybridParallelPlugin))
          else nullcontext()
      )
@@ -192,7 +273,7 @@ index 4045556..24b7b26 100644
  
      with init_ctx:
          # from_pretrained is not compatible with LoRA, we load pretrained weights later.
-@@ -198,6 +227,18 @@ def train(args) -> None:
+@@ -198,6 +263,23 @@ def train(args) -> None:
              torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
          )
  
@@ -208,10 +289,15 @@ index 4045556..24b7b26 100644
 +        # (inv_freq = f(self.original_inv_freq)), 物化时无限递归; 直接重建为具体值
 +        _fix_lazy_rotary_buffers(model)
 +
++        # HF 精度策略复现: hc/sinks/norm 等敏感模块保持 fp32 (checkpoint 以 fp32 存储,
++        # bf16 量化会导致训练 loss 异常偏高)
++        if args.mixed_precision == "bf16":
++            _keep_strict_fp32(model)
++
          if args.lora_rank > 0:
              if model.__class__.__name__.startswith("DeepseekV3"):
                  lora_config = LoraConfig(
-@@ -206,6 +247,18 @@ def train(args) -> None:
+@@ -206,6 +288,18 @@ def train(args) -> None:
                      lora_alpha=args.lora_alpha,
                      target_modules=["gate_proj", "up_proj", "down_proj"],
                  )
@@ -230,7 +316,7 @@ index 4045556..24b7b26 100644
              else:
                  lora_config = LoraConfig(task_type="CAUSAL_LM", r=args.lora_rank, lora_alpha=args.lora_alpha)
              model = booster.enable_lora(model, lora_config=lora_config)
-@@ -257,7 +310,7 @@ def train(args) -> None:
+@@ -257,7 +351,7 @@ def train(args) -> None:
      )
  
      torch.set_default_dtype(torch.float)
@@ -239,7 +325,7 @@ index 4045556..24b7b26 100644
  
      coordinator.print_on_master(
          f"Booster init max device memory: {accelerator.max_memory_allocated() / 1024 ** 2:.2f} MB"
-@@ -441,6 +494,14 @@ if __name__ == "__main__":
+@@ -441,6 +535,17 @@ if __name__ == "__main__":
      parser.add_argument(
          "--zero_cpu_offload", default=False, action="store_true", help="Whether to use offloading, used for 3d plugin."
      )
@@ -251,6 +337,9 @@ index 4045556..24b7b26 100644
 +    )
 +    parser.add_argument("--system_prompt", type=str, default="", help="System prompt prepended to conversations.")
 +    parser.add_argument("--use_fp8", default=False, action="store_true", help="Enable FP8 mixed-precision training (moe plugin).")
++    parser.add_argument(
++        "--no_fused_norm", default=False, action="store_true", help="Disable FusedRMSNorm replacement (debug)."
++    )
      parser.add_argument(
          "--microbatch_size", type=int, default=1, help="Batch size for each process in PP, used for 3d plugin."
      )
@@ -513,10 +602,10 @@ index 4b36dbe..fdc9a61 100644
 +                req.wait()
 diff --git a/colossalai/shardformer/modeling/deepseek_v4.py b/colossalai/shardformer/modeling/deepseek_v4.py
 new file mode 100644
-index 0000000..1ec32df
+index 0000000..fd67119
 --- /dev/null
 +++ b/colossalai/shardformer/modeling/deepseek_v4.py
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,273 @@
 +# Adaptation of Shardformer MoE expert parallelism for DeepSeek-V4 (transformers >= 5.x)
 +#
 +# Differences vs DeepseekV3:

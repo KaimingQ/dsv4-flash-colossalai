@@ -12,6 +12,7 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 MODEL=${MODEL:-"${MODEL_ROOT:?需先设置 MODEL_ROOT(模型权重所在目录)}/DeepSeek-V4-Flash-BF16-v2"}
 DATASET=${DATASET:-data/sft_public.jsonl}
 SAVE_DIR=${SAVE_DIR:-output/dsv4-lora-sft-full}
+TB_DIR=${TB_DIR:-logs/tb-sft-full}
 SFT_BS=${SFT_BS:-2}
 SFT_ACC=${SFT_ACC:-2}
 
@@ -36,5 +37,5 @@ colossalai run --nproc_per_node 8 "${TRAIN_SCRIPT}" \
     --warmup_steps 20 \
     --grad_clip 1.0 \
     --use_grad_checkpoint \
-    --tensorboard_dir logs/tb-sft-full \
+    --tensorboard_dir "${TB_DIR}" \
     --save_dir "${SAVE_DIR}" 2>&1 | tee logs/full_run.log
