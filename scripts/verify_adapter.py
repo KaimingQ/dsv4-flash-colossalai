@@ -5,6 +5,7 @@
     python scripts/verify_adapter.py --adapter output/smoke-lora/lora
 """
 import argparse
+import os
 
 import torch
 from peft import PeftConfig, PeftModel
@@ -33,7 +34,6 @@ with torch.device("meta"):
 model = PeftModel(base, args.adapter) if False else None
 # PeftModel 需要实体权重; meta 下改用结构检查:
 from safetensors.torch import load_file
-import os
 
 files = [f for f in os.listdir(args.adapter) if f.endswith((".bin", ".safetensors"))]
 sd = torch.load(os.path.join(args.adapter, files[0]), map_location="cpu", weights_only=True) if files[0].endswith(".bin") else load_file(os.path.join(args.adapter, files[0]))
