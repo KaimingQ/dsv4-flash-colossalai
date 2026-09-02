@@ -11,8 +11,8 @@
 | 插件 | `--plugin moe`（本项目为 `train_dpo.py` 新增的 EP 路线） |
 | 损失 | SimPO（`--disable_reference_model`，省去第二份 568GB 参考模型） |
 | 超参 | beta=2.0, gamma=0.5, lr=5e-6, seq512, bs2, acc2, LoRA r16 |
-| 数据 | 4257 偏好对 × 1 epoch（133 步，28 分钟） |
-| 结果 | loss 收敛至 1.2，chosen/rejected reward 形成区分 |
+| 数据 | 4257 偏好对 × 1 epoch（133 步，31 分钟，14.2 s/it） |
+| 结果 | loss 全程稳定在 ~1.0（0.90~1.10），reward accuracy ~0.47（chosen/rejected 区分有限） |
 | 产物 | `output/dsv4-dpo/modeling/`（EP 分片，`merge_ep_shards_to_hf.py` 可导出 HF 格式） |
 
 插件选型记录（如实）：
@@ -25,9 +25,9 @@
 | 项 | 值 |
 |---|---|
 | 超参 | lam=0.1, lr=5e-6, seq512, bs1×acc4（有效批 32）, LoRA r16, grad_checkpoint |
-| 数据 | 与 DPO 共享 4257 偏好对 × 1 epoch（133 优化步，38 分钟，17.19 s/it） |
-| 结果 | loss 5.50 → **4.07** 稳定下降，**全程零 nan** |
-| 显存 | 峰值 **84.8GB/卡**（96GB 的 88%）；bs2 时 97GB 顶满死锁，故取 bs1×acc4 |
+| 数据 | 与 DPO 共享 4257 偏好对 × 1 epoch（133 优化步，40 分钟，21.9 s/it） |
+| 结果 | loss ~1.1 → **~0.5** 稳定下降，**全程零 nan** |
+| 显存 | 峰值 **84.7GB/卡**（96GB 的 88%）；bs2 时 97GB 顶满死锁，故取 bs1×acc4 |
 | 产物 | `output/dsv4-orpo/modeling/`（626GB EP 分片，可导出 HF 格式） |
 
 ### 2.1 初版失败现象

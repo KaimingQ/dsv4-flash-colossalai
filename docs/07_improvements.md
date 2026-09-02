@@ -14,6 +14,7 @@
 | 框架适配 | 官方无 V4 policy；融合专家无法切分 | 自研 EP policy + 逐专家键布局 | 800 行补丁 / 10 文件 |
 | 训练 | OOM / NCCL 超时 / 显存死锁（冒烟 10 轮） | 配置调优 + 根因修复 | 三阶段跑通 |
 | ORPO | 三层叠加的 nan 数值漏洞 | 诊断探针 + 稳定化重写 | 133 步零 nan |
+| SFT loss | EP combine 错位 + 报告聚合偏大 8 倍 | 层级对拍逐层排除 + 手工 CE 复核 | loss 1.07→0.39 |
 
 **模型关键参数**（决定所有技术选型）：284,332,230,231 参数；43 层；
 256 路由专家 + 1 共享专家；3 个 hash 路由层（`tid2eid` 静态查表）+ 40 个 topk 层；
@@ -105,8 +106,8 @@ transformers 5.x 中是全新实现（融合 3D 专家、双层压缩注意力�
 
 仿 `EpDeepseekV3MoE` 实现，处理 V4 特有差异：
 - **token 路由**：`sort_order = flat_idx.argsort(stable=True)` 按全局专家号排序 →
-  `all_to_all_uneven` dispatch 到持有 rank → 局部按专家分组计算 →
-  反向 `all_to_all_uneven` combine → `index_add_(0, sort_order // k, ...)`
+  `all_to_all_uneven` dispatch 到持有 rank → 局部按本地专家分组计算（`local_order`）→
+  专家计算后**先逆置换恢复接收顺序再 combine 回传** → `index_add_(0, sort_order // k, ...)`
   恢复原序并累加同一 token 的 k 个专家输出；
 - **梯度缩放**：`DPGradScalerIn/Out`（MoE-DP 组）与 `EPGradScalerIn/Out`（EP 组）
   保证切分后的梯度语义等价；`activate_experts` 必须统计**本 rank 局部专家**
@@ -184,7 +185,7 @@ DPO 偏好对 4257 对（同题多解，按推导完整度/格式构造 chosen/r
 | 7 | 数据集构造报错 | 发布版无 `chat_template` → 补 DeepSeek 风格模板脚本 |
 | 8 | `TypeError` 混入字符串 | `BatchEncoding` 兼容（见 3.3-4） |
 | 9 | `NameError` | `gt_answer` 初始化（见 3.3-5） |
-| 10 | **通过**：31 步 / 4.27s/it / loss 136→122 / 83.5GB/卡 | — |
+| 10 | **通过**：31 步 / 4.27s/it / loss 0.78~1.05（正常量级） / 83.5GB/卡 | — |
 
 ### 5.2 正式 SFT 调优
 
@@ -192,7 +193,7 @@ DPO 偏好对 4257 对（同题多解，按推导完整度/格式构造 chosen/r
 |---|---|---|
 | seq1024 × bs4 | 反向 OOM（93.8GB 已用 + 需 1.97GB） | 激活翻倍，放弃 |
 | seq512 × bs4 + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | rank7 `unhandled cuda error` → 首层 all-to-all 超时 | 该分配器选项与本环境 NCCL a2a **不兼容**，弃用并记录 |
-| seq512 × bs2 × acc2（有效批 8） | **通过**：1250 步 / 4.14s/it / loss 45.7→10.4 / 82.1GB/卡 | 最终配置；产物导出 bin + safetensors 双格式 |
+| seq512 × bs2 × acc2（有效批 8） | **通过**：1250 步 / 4.14s/it / loss 1.07→0.39 / 82.1GB/卡 | 最终配置；产物导出 bin + safetensors 双格式 |
 
 ### 5.3 DPO/SimPO 插件选型（实测排除法）
 
@@ -200,7 +201,7 @@ DPO 偏好对 4257 对（同题多解，按推导完整度/格式构造 chosen/r
 |---|---|
 | `gemini` | GeminiPlugin **显式不支持 LoRA**（启动即拒）→ 排除 |
 | `3d`（HybridParallel） | 无专家并行切分，融合专家 568GB 落单卡 → **OOM 实测** → 排除 |
-| `moe`（本项目为 `train_dpo.py` 新增该路线） | EP=8 + ZeRO1，与 SFT 同一验证路线 → **通过**：133 步 / 29 分钟 / loss 收敛至 1.2 / 85.5GB/卡 |
+| `moe`（本项目为 `train_dpo.py` 新增该路线） | EP=8 + ZeRO1，与 SFT 同一验证路线 → **通过**：133 步 / 31 分钟 / loss 稳定在 ~1.0 / 87.6GB/卡 |
 
 算法选 **SimPO**（`--disable_reference_model`）：省去第二份 568GB 参考模型，
 是 8×96GB 上能完成偏好对齐的关键。
@@ -233,8 +234,36 @@ DPO 偏好对 4257 对（同题多解，按推导完整度/格式构造 chosen/r
   **`File ... cannot be opened`（rank4）崩溃** → 改 600（> 532 micro 步），
   仅末尾保存。
 
-**结果**：133 步全程零 nan / 38 分钟 / 17.2 s/it / loss 5.50→4.07 /
-84.8GB/卡，626GB 产物（641 分片）成功保存。
+**结果**：133 步全程零 nan / 40 分钟 / 21.9 s/it / loss ~1.1→~0.5 /
+84.7GB/卡，626GB 产物（641 分片）成功保存。
+
+### 5.5 SFT loss 异常偏高攻坚（EP combine 错位 + 报告聚合偏大）
+
+**现象**：LoRA SFT 的 loss 报告值远高于基座模型在 HF 原生前向下的真实 NLL
+（同分布数学数据实测 ~0.8），终值仍处于随机预测水平。排查发现两个独立 bug 叠加：
+
+1. **EP combine 缺逆置换（正确性 bug）**：`EpDeepseekV4MoE.ep_experts_forward`
+   按本地专家分组计算前用 `local_order` 重排接收序列，回传前未做逆置换，
+   源 rank 收到错位的专家输出（每个 token 拿到其他专家的结果）——
+   对照 `EpDeepseekV3MoE` 的 `new_x[gatherd_idxs] = outs` 还原步骤，
+   V4 移植时遗漏；
+2. **报告聚合偏大（显示 bug）**：`lora_finetune.py` 的 `all_reduce_mean`
+   原地 all_reduce 求和后只返回商，SFT 分支丢弃返回值直接复用原张量，
+   报告的是 8 卡之和而非均值。
+
+**定位过程（逐层排除法）**：
+1. 基座模型 HF 评测正确率 0.90 → 权重转换与原生前向无误，问题在训练路径；
+2. 层级数值对拍（真实权重单层、8 卡 EP）：`EpDeepseekV4MoE` 输出与原生
+   `DeepseekV4SparseMoeBlock` 完全不一致 → 锁定 EP 路径；
+3. 二分拆解：单专家计算、本地分组计算均精确 → 问题在 all-to-all dispatch/combine；
+4. 复刻 dispatch/combine 的独立脚本逐 pair 对拍通过 → 差异在 `local_order` 重排后的回传；
+5. 修复逆置换后层级对拍误差降至 bf16 噪声级（0.06）；
+6. 训练首步 loss 已正常但仍偏离基线 → 手工重算 CE 与 `model.loss` 一致，
+   差异仅在 tqdm 报告聚合 → 定位到 `all_reduce_mean` 丢弃返回值。
+
+**修复**：combine 前 `unsorted[local_order] = local_out` 恢复接收顺序；
+`all_reduce_mean` 改为原地除以组大小。修复后冒烟与正式重训 loss 均与
+HF 基线一致（见 5.2 与 `docs/06_report.md`）。
 
 ## 6. 工程环境攻坚（NFS / GPU 运维）
 
@@ -251,9 +280,9 @@ DPO 偏好对 4257 对（同题多解，按推导完整度/格式构造 chosen/r
 
 | 阶段 | 数据/步数 | 吞吐 | 单卡峰值显存 | 收敛 |
 |---|---|---|---|---|
-| LoRA SFT | 10k×2ep / 1250 步 | 4.14 s/it（约 86 分钟） | 82.1GB / 96GB | loss 45.7 → 10.4 |
-| DPO/SimPO | 4257 对 / 133 步 | 13.0 s/it（29 分钟） | 85.5GB / 96GB | loss 收敛至 1.2 |
-| ORPO | 4257 对 / 133 步 | 17.2 s/it（38 分钟） | 84.8GB / 96GB | loss 5.50 → 4.07，零 nan |
+| LoRA SFT | 10k×2ep / 1250 步 | 4.14 s/it（约 86 分钟） | 83.7GB / 96GB | loss 1.07 → 0.39 |
+| DPO/SimPO | 4257 对 / 133 步 | 14.2 s/it（31 分钟） | 87.6GB / 96GB | loss 稳定在 ~1.0 |
+| ORPO | 4257 对 / 133 步 | 21.9 s/it（40 分钟） | 84.7GB / 96GB | loss ~1.1 → ~0.5，零 nan |
 
 ColossalAI 优势体现：
 1. **省显存**：568GB 权重 + 激活/优化器状态装进 768GB 总显存（朴素方案单卡
@@ -281,7 +310,11 @@ ColossalAI 优势体现：
 7. 集合通信的"卡死"用**最小分布式复现脚本**定位（小模型绕开加载时间）；
 8. 分配器选项（如 `expandable_segments`）与集合通信可能冲突，启用前小规模验证；
 9. GPU 独占任务严格串行；后台任务检查前先确认进程存活；
-10. NFS 上大文件写入控制频率（检查点过密会崩），编辑要回读验证。
+10. NFS 上大文件写入控制频率（检查点过密会崩），编辑要回读验证；
+11. EP dispatch/combine 是顺序敏感的双向操作：分组计算后的回传必须做
+    **逆置换恢复接收顺序**，上线前用真实权重做层级前向对拍（随机权重测不出错位）；
+12. 分布式 loss 报告要用返回值或确认原地语义，否则"loss 异常"可能是
+    报告口径错误而非训练错误——先手工重算 CE 对比再怀疑前向。
 
 ## 9. 细节优化实验：用满显存余量换吞吐（实测）
 

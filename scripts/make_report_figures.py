@@ -23,7 +23,10 @@ os.makedirs(FIG_DIR, exist_ok=True)
 
 # tqdm 行: "Epoch 0:  5%|...| 16/31 [00:34<..., loss=131.00, lr=...]"
 # ORPO tqdm 描述: "Epoch 1/1 Loss: 4.0726:  37%|...| 50/133 [15:21<25:30, 18.43s/it]"
-LOSS_RE = re.compile(r"Epoch (\d+)(?:/\d+)?:.*?(\d+)/(\d+) \[[^\]]*, loss=([\d.]+)")
+LOSS_RE = re.compile(r"Epoch (\d+)(?:/\d+)?:.*?(\d+)/(\d+) \[[^\]]*loss=([\d.]+)")
+# DPO/SimPO 的 tqdm 描述为 "Epoch 1/1: ... train/loss=x" (epoch 从 1 计数),
+# 走通用 LOSS_RE 会被折算成第二 epoch 造成 step 偏移, 单独匹配取步内序号
+LOSS_RE_DPO = re.compile(r"Epoch \d+/\d+:.*?(\d+)/(\d+) \[[^\]]*train/loss=([\d.]+)")
 # ORPO 行含大量 \r 撕裂, 用无 epoch 前缀的宽松匹配 (单 epoch)
 LOSS_RE_ORPO = re.compile(r"Loss: ([\d.]+):\s*\d+%\|[^\|]*\|\s*(\d+)/(\d+) \[")
 MEM_RE = re.compile(r"Max (?:device|CUDA) memory usage: ([\d.]+) MB|Booster init max CUDA memory: ([\d.]+) MB")
@@ -38,6 +41,11 @@ def parse_losses(path):
     """返回 [(global_step, loss)], 多 epoch 时按每 epoch 步数拼接"""
     pts = []
     for line in read_log(path).split("\n"):
+        m = LOSS_RE_DPO.search(line)
+        if m:
+            cur, total, loss = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            pts.append((cur, loss))
+            continue
         m = LOSS_RE.search(line)
         if m:
             ep, cur, total, loss = int(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4))
@@ -68,9 +76,9 @@ def smooth(ys, w=10):
 
 
 # ---- 1) loss 曲线 ----
-# DPO/SimPO 的 per-step loss 仅写入 tensorboard (stdout 只有终值 1.2), 故曲线图只含 SFT 与 ORPO
 RUNS = [
     ("SFT (LoRA)", "logs/full_run.log"),
+    ("DPO/SimPO (SimPO loss)", "logs/dpo_run.log"),
     ("ORPO", "logs/orpo_run.log"),
 ]
 fig, axes = plt.subplots(1, len(RUNS), figsize=(5.2 * len(RUNS), 3.6), sharey=False)

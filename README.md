@@ -20,9 +20,9 @@
 
 | 阶段 | 数据 | 收敛情况 | 单卡峰值显存 |
 |---|---|---|---|
-| LoRA SFT（1250 步，4.14s/it） | NuminaMath-CoT 10k×2ep | loss 1.07 → 0.39（修复后重训；曾报 45.7 → 10.4，系 EP combine 错位 + 报告聚合偏大 8 倍） | 82.1GB / 96GB |
-| DPO/SimPO（133 步，13.0s/it） | NuminaMath 偏好对 4257 | loss 收敛至 1.2 | 85.5GB / 96GB |
-| ORPO（133 步，17.2s/it） | 同上 | loss 5.50 → 4.07，全程零 nan | 84.8GB / 96GB |
+| LoRA SFT（1250 步，4.14s/it） | NuminaMath-CoT 10k×2ep | loss 1.07 → 0.39 | 82.1GB / 96GB |
+| DPO/SimPO（133 步，14.2s/it） | NuminaMath 偏好对 4257 | loss 稳定在 ~1.0 | 87.6GB / 96GB |
+| ORPO（133 步，21.9s/it） | 同上 | loss ~1.1 → ~0.5，全程零 nan | 84.7GB / 96GB |
 
 > 完整数据、loss/显存曲线图与复现命令见 [`docs/06_report.md`](docs/06_report.md)。
 
