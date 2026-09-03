@@ -265,6 +265,43 @@ DPO 偏好对 4257 对（同题多解，按推导完整度/格式构造 chosen/r
 `all_reduce_mean` 改为原地除以组大小。修复后冒烟与正式重训 loss 均与
 HF 基线一致（见 5.2 与 `docs/06_report.md`）。
 
+### 5.6 EP MoE 吞吐优化（torch.profiler 定位，参照 Megatron-Core / DeepEP 思路）
+
+**方法**：给 `lora_finetune.py` 接入 `torch.profiler`（`PROFILE_STEPS` 环境变量控制，
+wait=1/warmup=2/active=N 窗口，rank0 导出 chrome trace，采完提前退出）。
+4 步采样显示 GPU busy 仅 65%，三大瓶颈：
+
+| 瓶颈 | 证据（4 步窗口） | 占比 |
+|---|---|---|
+| GPU→CPU 同步风暴 | `_local_scalar_dense` 4.4 万次、`cudaMemcpyAsync` 5.8 万次、`cudaStreamSynchronize` 2.5s；EP 专家循环内 `int(local_counts[e])` + `DPGradScaler` 的 tensor assert 每层 ~100 次同步 | GPU 空闲 35% 主因 |
+| NCCL all_to_all 等待 | 1720 次 ×2.7~4ms，rank 间方差 30%~45%（同步导致各 rank 到达集合点相位不齐） | GPU 时间 30~45% |
+| 专家小 GEMM + eager attention 物化 | `aten::mm` 5.2 万次 ×47~68µs；MQA `repeat_kv` 64 倍拷贝 + `[B,64,S,S]` 物化 | 16~24% / ~20% |
+
+**优化**（`colossalai/shardformer/modeling/deepseek_v4.py`）：
+1. **同步消除**：`local_counts.tolist()`/`activate_experts.tolist()` 每层各 1 次批量取回，
+   替代循环内逐专家同步；
+2. **grouped GEMM**（Megatron `TEGroupedMLP` 思路）：`fuse_local_experts` 在权重加载后将本地
+   32 专家融合为 3D 冻结权重，forward 用 `torch._grouped_mm` 一次计算（每组 pad 到 8 的倍数
+   满足 cutlass 16B 对齐，平均 ~11% 冗余计算）；fuse 前两阶段清理 optimizer/ZeRO 容器对原
+   参数的引用链（HybridAdam 全量收集 + `pg_to_param_list` + `param_to_pg`）并打断
+   LazyTensor `tolist` 自引用环——否则原参数无法释放导致 OOM；
+   `unfuse_local_experts` 供完整 EP 分片保存前还原布局；
+3. **attention 等价提速**（head_dim=512 无法走 SDPA/FA）：`v4_fast_eager_attention` 用 MQA
+   matmul 广播免 `repeat_kv` 64 倍拷贝，sinks 并入 softmax 的 max/分母免 `[.., S+1]` cat；
+   单测对拍与 HF eager 差异为 bf16 噪声级，fwd 5.21→3.91ms。
+
+**效果**（SFT 冒烟 4 步 profile 窗口，loss 完全一致 0.892~0.893）：
+
+| 指标 | 基线 | 同步消除 | +grouped GEMM/attention |
+|---|---|---|---|
+| 每步耗时 | 5.60s | 4.30s | **3.38s** |
+| `nccl all_to_all` | 4.59s | 3.22s | **1.34s（-71%）** |
+| kernel launch 数 | 51.3 万 | 48.1 万 | **37.7 万** |
+
+实际端到端：LoRA SFT 4.14→**3.11 s/it**（-25%），DPO/SimPO 全量重训 14.2→**11.26 s/it**
+（133 步 25 分 13 秒，loss 0.997 与基线一致，fuse/unfuse 保存路径验证通过）。
+单测 `scripts/test_grouped_forward.py`（空组/任意 counts/8 倍数边界）ALL PASS。
+
 ## 6. 工程环境攻坚（NFS / GPU 运维）
 
 | 困难 | 现象 | 对策 |
