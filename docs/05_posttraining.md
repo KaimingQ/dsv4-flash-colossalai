@@ -11,8 +11,8 @@
 | 插件 | `--plugin moe`（本项目为 `train_dpo.py` 新增的 EP 路线） |
 | 损失 | SimPO（`--disable_reference_model`，省去第二份 568GB 参考模型） |
 | 超参 | beta=2.0, gamma=0.5, lr=5e-6, seq512, bs2, acc2, LoRA r16 |
-| 数据 | 4257 偏好对 × 1 epoch（133 步，25 分钟，11.26 s/it） |
-| 结果 | loss 全程稳定在 ~1.0（终值 0.997），reward accuracy ~0.47（chosen/rejected 区分有限） |
+| 数据 | 4257 偏好对 × 1 epoch（133 步，31 分钟，14.2 s/it） |
+| 结果 | loss 全程稳定在 ~1.0（0.90~1.10），reward accuracy ~0.47（chosen/rejected 区分有限） |
 | 产物 | `output/dsv4-dpo/modeling/`（EP 分片，`merge_ep_shards_to_hf.py` 可导出 HF 格式） |
 
 插件选型记录（如实）：
@@ -71,3 +71,12 @@ docker exec dsv4-colossal-train python scripts/add_chat_template.py output/dsv4-
 ```
 
 各阶段训练数据（步数/吞吐/显存/收敛）见 `docs/06_report.md`。
+
+## 3. 吞吐优化后的端到端数据
+
+同步消除 + grouped GEMM + attention 提速后（loss 与基线一致，见 `docs/07_improvements.md` 第 10 节）：
+
+| 阶段 | 优化前 | 优化后 |
+|---|---|---|
+| DPO/SimPO（133 步全量重训） | 14.2 s/it（31 分钟） | **11.26 s/it（25 分 13 秒）**，loss 终值 0.997 |
+| LoRA SFT | 4.14 s/it | **3.11 s/it** |

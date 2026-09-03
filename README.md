@@ -21,10 +21,16 @@
 | 阶段 | 数据 | 收敛情况 | 单卡峰值显存 |
 |---|---|---|---|
 | LoRA SFT（1250 步，4.14s/it） | NuminaMath-CoT 10k×2ep | loss 1.07 → 0.39 | 82.1GB / 96GB |
-| DPO/SimPO（133 步，11.3s/it） | NuminaMath 偏好对 4257 | loss 稳定在 ~1.0 | 87.8GB / 96GB |
+| DPO/SimPO（133 步，14.2s/it） | NuminaMath 偏好对 4257 | loss 稳定在 ~1.0 | 87.6GB / 96GB |
 | ORPO（133 步，21.9s/it） | 同上 | loss ~1.1 → ~0.5，全程零 nan | 84.7GB / 96GB |
 
 > 完整数据、loss/显存曲线图与复现命令见 [`docs/06_report.md`](docs/06_report.md)。
+
+## 吞吐优化（EP MoE，torch.profiler 定位后实施）
+
+在 loss 与基线完全一致的前提下，同步消除 + grouped GEMM（Megatron TEGroupedMLP 思路）+ attention 等价提速
+使训练吞吐提升约 25%：LoRA SFT 4.14 → **3.11 s/it**，DPO/SimPO 14.2 → **11.26 s/it**（全量重训验证，
+loss 0.997）。定位与实施过程见 [`docs/07_improvements.md`](docs/07_improvements.md) 第 10 节。
 
 ## 目录结构
 
