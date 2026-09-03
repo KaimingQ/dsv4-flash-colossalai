@@ -45,7 +45,7 @@ bash scripts/setup_env.sh   # 容器内：从挂载源码安装已适配的 Colo
 | 组件 | 版本 | 说明 |
 |---|---|---|
 | PyTorch | 2.8.0a0 (nv25.06) | 超出官方声明的 `<=2.5.1`，实测可运行（见 02 文档） |
-| transformers | 5.15.1 | 原生支持 `model_type=deepseek_v4`（键名映射内置于 `conversion_mapping.py`） |
+| transformers | 5.16.1 | 原生支持 `model_type=deepseek_v4`（键名映射内置于 `conversion_mapping.py`） |
 | ColossalAI | 0.5.0（main, 4f9953b） | 源码安装 `--no-deps`（绕开官方钉死的版本约束） |
 | peft | 0.20.0 | LoRA |
 | datasets | 5.0.1 | 数据准备 |
