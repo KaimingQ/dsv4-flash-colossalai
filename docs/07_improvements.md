@@ -378,6 +378,12 @@ wait=1/warmup=2/active=N 窗口，rank0 导出 chrome trace，采完提前退出
 | `nccl all_to_all` | 4.59s | 3.22s | **1.34s（-71%）** |
 | kernel launch 数 | 51.3 万 | 48.1 万 | **37.7 万** |
 
-实际端到端：LoRA SFT 4.14→**3.11 s/it**（-25%），DPO/SimPO 全量重训 14.2→**11.26 s/it**
-（133 步 25 分 13 秒，loss 0.997 与基线一致，fuse/unfuse 保存路径验证通过）。
+实际端到端全量重训（三阶段 loss 均与基线一致，fuse/unfuse 保存路径验证通过，adapter 校验 892 张量 / 63.49M 参数通过）：
+
+| 阶段 | 优化前 | 优化后 |
+|---|---|---|
+| LoRA SFT（1250 步） | 4.14 s/it（约 86 分钟） | **2.98 s/it（约 62 分钟）**，loss 终值 0.383 |
+| DPO/SimPO（133 步） | 14.2 s/it（31 分钟） | **11.26 s/it（25 分 13 秒）**，loss 终值 0.997 |
+| ORPO（133 步） | 21.9 s/it（40 分钟） | **13.12 s/it（29 分 04 秒）**，loss 末值 0.70，84.8GB/卡 |
+
 单测 `scripts/test_grouped_forward.py`（空组/任意 counts/8 倍数边界）ALL PASS。

@@ -79,4 +79,5 @@ docker exec dsv4-colossal-train python scripts/add_chat_template.py output/dsv4-
 | 阶段 | 优化前 | 优化后 |
 |---|---|---|
 | DPO/SimPO（133 步全量重训） | 14.2 s/it（31 分钟） | **11.26 s/it（25 分 13 秒）**，loss 终值 0.997 |
-| LoRA SFT | 4.14 s/it | **3.11 s/it** |
+| ORPO（133 步全量重训） | 21.9 s/it（40 分钟） | **13.12 s/it（29 分 04 秒）**，loss 末值 0.70，零 nan |
+| LoRA SFT（1250 步） | 4.14 s/it（约 86 分钟） | **2.98 s/it（约 62 分钟）**，loss 终值 0.383 |

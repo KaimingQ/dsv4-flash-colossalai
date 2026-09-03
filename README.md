@@ -29,8 +29,9 @@
 ## 吞吐优化（EP MoE，torch.profiler 定位后实施）
 
 在 loss 与基线完全一致的前提下，同步消除 + grouped GEMM（Megatron TEGroupedMLP 思路）+ attention 等价提速
-使训练吞吐提升约 25%：LoRA SFT 4.14 → **3.11 s/it**，DPO/SimPO 14.2 → **11.26 s/it**（全量重训验证，
-loss 0.997）。定位与实施过程见 [`docs/07_improvements.md`](docs/07_improvements.md) 第 10 节。
+三阶段全量重训实测（loss 均与基线一致）：LoRA SFT 4.14 → **2.98 s/it（-28%）**、
+DPO/SimPO 14.2 → **11.26 s/it（-21%）**、ORPO 21.9 → **13.12 s/it（-40%）**。
+定位与实施过程见 [`docs/07_improvements.md`](docs/07_improvements.md) 第 10 节。
 
 ## 目录结构
 
