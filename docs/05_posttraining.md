@@ -72,7 +72,7 @@ docker exec dsv4-colossal-train python scripts/add_chat_template.py output/dsv4-
 
 各阶段训练数据（步数/吞吐/显存/收敛）见 `docs/06_report.md`。
 
-## 3. 吞吐优化后的端到端数据
+## 5. 吞吐优化后的端到端数据（2026-09 优化分支）
 
 同步消除 + grouped GEMM + attention 提速后（loss 与基线一致，见 `docs/07_improvements.md` 第 10 节）：
 
